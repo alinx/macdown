@@ -9,8 +9,10 @@
 #import "MPMainController.h"
 #import <MASPreferences/MASPreferencesWindowController.h>
 #import <Sparkle/SUUpdater.h>
+#import "MPGlobals.h"
 #import "MPUtilities.h"
 #import "NSDocumentController+Document.h"
+#import "NSUserDefaults+Suite.h"
 #import "MPPreferences.h"
 #import "MPGeneralPreferencesViewController.h"
 #import "MPMarkdownPreferencesViewController.h"
@@ -145,7 +147,6 @@ NS_INLINE void treat()
                    name:MPDidDetectFreshInstallationNotification
                  object:self.prefereces];
     [self copyFiles];
-    [self openPendingFiles];
     return self;
 }
 
@@ -154,7 +155,14 @@ NS_INLINE void treat()
 
 - (BOOL)applicationShouldOpenUntitledFile:(NSApplication *)sender
 {
+    if (self.prefereces.filesToOpen.count)
+        return NO;
     return !self.prefereces.supressesUntitledDocumentOnLaunch;
+}
+
+- (void)applicationDidBecomeActive:(NSNotification *)notification
+{
+    [self openPendingFiles];
 }
 
 
@@ -210,9 +218,10 @@ NS_INLINE void treat()
 - (void)openPendingFiles
 {
     NSDocumentController *c = [NSDocumentController sharedDocumentController];
-    for (NSString *path in self.prefereces.filesToOpenOnNextLaunch)
+
+    for (NSString *path in self.prefereces.filesToOpen)
     {
-        NSURL *url = [NSURL URLWithString:path];
+        NSURL *url = [NSURL fileURLWithPath:path];
         if ([url checkResourceIsReachableAndReturnError:NULL])
         {
             [c openDocumentWithContentsOfURL:url display:YES
@@ -223,7 +232,9 @@ NS_INLINE void treat()
             [c openUntitledDocumentForURL:url display:YES error:NULL];
         }
     }
-    self.prefereces.filesToOpenOnNextLaunch = nil;
+
+    self.prefereces.filesToOpen = nil;
+    [self.prefereces synchronize];
     treat();
 }
 

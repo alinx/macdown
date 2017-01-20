@@ -171,7 +171,7 @@ NS_INLINE NSColor *MPGetWebViewBackgroundColor(WebView *webview)
 @interface MPDocument ()
     <NSSplitViewDelegate, NSTextViewDelegate,
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 101100
-     WebFrameLoadDelegate, WebPolicyDelegate,
+     WebEditingDelegate, WebFrameLoadDelegate, WebPolicyDelegate,
 #endif
      MPAutosaving, MPRendererDataSource, MPRendererDelegate>
 
@@ -448,28 +448,11 @@ static void (^MPGetPreviewLoadingCompletionHandler(MPDocument *doc))()
     }
 }
 
-- (void)canCloseDocumentWithDelegate:(id)delegate
-                 shouldCloseSelector:(SEL)selector contextInfo:(void *)context
-{
-    selector = @selector(document:shouldClose:contextInfo:);
-    [super canCloseDocumentWithDelegate:delegate shouldCloseSelector:selector
-                            contextInfo:context];
-}
-
-- (void)document:(NSDocument *)doc shouldClose:(BOOL)shouldClose
-     contextInfo:(void *)contextInfo
-{
-    if (!shouldClose)
-        return;
-
-    [self close];
-}
-
 - (void)close
 {
     if (self.needsToUnregister) 
     {
-        // close can be called multiple times
+        // Close can be called multiple times, but this can only be done once.
         // http://www.cocoabuilder.com/archive/cocoa/240166-nsdocument-close-method-calls-itself.html
         self.needsToUnregister = NO;
 
@@ -502,6 +485,16 @@ static void (^MPGetPreviewLoadingCompletionHandler(MPDocument *doc))()
 + (NSArray *)writableTypes
 {
     return @[@"net.daringfireball.markdown"];
+}
+
+- (BOOL)isDocumentEdited
+{
+    // Prevent save dialog on an unnamed, empty document. The file will still
+    // show as modified (because it is), but no save dialog will be presented
+    // when the user closes it.
+    if (!self.presentedItemURL && !self.editor.string.length)
+        return NO;
+    return [super isDocumentEdited];
 }
 
 - (BOOL)writeToURL:(NSURL *)url ofType:(NSString *)typeName
@@ -543,12 +536,6 @@ static void (^MPGetPreviewLoadingCompletionHandler(MPDocument *doc))()
 - (BOOL)prepareSavePanel:(NSSavePanel *)savePanel
 {
     savePanel.extensionHidden = NO;
-    NSString *fileName = self.presumedFileName;
-    if (fileName && ![fileName hasExtension:@"md"])
-    {
-        fileName = [fileName stringByAppendingPathExtension:@"md"];
-        savePanel.nameFieldStringValue = fileName;
-    }
     if (self.fileURL && self.fileURL.isFileURL)
     {
         NSString *path = self.fileURL.path;
@@ -561,6 +548,16 @@ static void (^MPGetPreviewLoadingCompletionHandler(MPDocument *doc))()
             path = [path stringByDeletingLastPathComponent];
 
         savePanel.directoryURL = [NSURL fileURLWithPath:path];
+    }
+    else
+    {
+        // Suggest a file name for new documents.
+        NSString *fileName = self.presumedFileName;
+        if (fileName && ![fileName hasExtension:@"md"])
+        {
+            fileName = [fileName stringByAppendingPathExtension:@"md"];
+            savePanel.nameFieldStringValue = fileName;
+        }
     }
     savePanel.allowedFileTypes = nil;   // Allow all extensions.
     return [super prepareSavePanel:savePanel];
@@ -956,8 +953,53 @@ static void (^MPGetPreviewLoadingCompletionHandler(MPDocument *doc))()
     NSURL *baseUrl = self.fileURL;
     if (!baseUrl)   // Unsaved doument; just use the default URL.
         baseUrl = self.preferences.htmlDefaultDirectoryUrl;
-    [self.preview.mainFrame loadHTMLString:html baseURL:baseUrl];
+
     self.manualRender = self.preferences.markdownManualRender;
+
+#if 0
+    // Unfortunately this DOM-replacing causes a lot of problems...
+    // 1. MathJax needs to be triggered.
+    // 2. Prism rendering is lost.
+    // 3. Potentially more.
+    // Essentially all JavaScript needs to be run again after we replace
+    // the DOM. I have no idea how many more problems there are, so we'll have
+    // to back off from the path for now... :(
+
+    // If we're working on the same document, try not to reload.
+    if (self.isPreviewReady && [self.currentBaseUrl isEqualTo:baseUrl])
+    {
+        // HACK: Ideally we should only inject the parts that changed, and only
+        // get the parts we need. For now we only get a complete HTML codument,
+        // and rely on regex to get the parts we want in the DOM.
+
+        // Use the existing tree if available, and replace the content.
+        DOMDocument *doc = self.preview.mainFrame.DOMDocument;
+        DOMNodeList *htmlNodes = [doc getElementsByTagName:@"html"];
+        if (htmlNodes.length >= 1)
+        {
+            static NSString *pattern = @"<html>(.*)</html>";
+            static int opts = NSRegularExpressionDotMatchesLineSeparators;
+
+            // Find things inside the <html> tag.
+            NSRegularExpression *regex =
+                [[NSRegularExpression alloc] initWithPattern:pattern
+                                                     options:opts error:NULL];
+            NSTextCheckingResult *result =
+                [regex firstMatchInString:html options:0
+                                    range:NSMakeRange(0, html.length)];
+            html = [html substringWithRange:[result rangeAtIndex:1]];
+
+            // Replace everything in the old <html> tag.
+            DOMElement *htmlNode = (DOMElement *)[htmlNodes item:0];
+            htmlNode.innerHTML = html;
+
+            return;
+        }
+    }
+#endif
+
+    // Reload the page if there's not valid tree to work with.
+    [self.preview.mainFrame loadHTMLString:html baseURL:baseUrl];
     self.currentBaseUrl = baseUrl;
 }
 
@@ -1226,7 +1268,8 @@ static void (^MPGetPreviewLoadingCompletionHandler(MPDocument *doc))()
 
 - (IBAction)toggleUnorderedList:(id)sender
 {
-    [self.editor toggleBlockWithPattern:@"^[\\*\\+-] \\S" prefix:@"* "];
+    NSString *marker = self.preferences.editorUnorderedListMarker;
+    [self.editor toggleBlockWithPattern:@"^[\\*\\+-] \\S" prefix:marker];
 }
 
 - (IBAction)toggleBlockquote:(id)sender
@@ -1367,10 +1410,10 @@ static void (^MPGetPreviewLoadingCompletionHandler(MPDocument *doc))()
                 }];
         }
 
-        CGColorRef backgroundCGColor = self.editor.backgroundColor.CGColor;
-
         CALayer *layer = [CALayer layer];
-        layer.backgroundColor = backgroundCGColor;
+        CGColorRef backgroundCGColor = self.editor.backgroundColor.CGColor;
+        if (backgroundCGColor)
+            layer.backgroundColor = backgroundCGColor;
         self.editorContainer.layer = layer;
     }
     
